@@ -170,8 +170,12 @@ def preprocess_for_sft(
 
     input_ids = examples_tokenized["input_ids"]
     labels = copy.deepcopy(input_ids)
-    for label, source_len in utils.zip_(labels, sources_tokenized["input_ids_lens"]):
-        label[:source_len] = constants.IGNORE_INDEX  # Input context should not contribute to loss.
+    for label, source_len, example_len in utils.zip_(labels, sources_tokenized["input_ids_lens"], examples_tokenized["input_ids_lens"]):
+        if tokenizer.padding_side == "right":
+            label[:source_len] = constants.IGNORE_INDEX  # Input context should not contribute to loss.
+        else:
+            diff_len = example_len - source_len
+            label[:-diff_len] = constants.IGNORE_INDEX
 
     packaged_data = dict(
         input_ids=input_ids,

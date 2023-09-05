@@ -1,0 +1,4 @@
+{
+    "fsdp_transformer_layer_cls_to_wrap": ["DecoderLayer"],
+    "limit_all_gathers": true
+}

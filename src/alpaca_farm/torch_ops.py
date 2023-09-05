@@ -57,8 +57,38 @@ def compute_logprobs(logits: Tensor, labels: Tensor, ignore_index: int) -> Tenso
     """Compute per-token logprobs, zeroing out places with ignore_index (padding)."""
     return -F.cross_entropy(logits.permute(0, 2, 1), labels, reduction="none", ignore_index=ignore_index)
 
+def mean_std_with_mask(x, mask_id):
+    x_mask = x.not_equal(mask_id) # [1, 1, 0, 0]
+    x_mean = (x * x_mask).sum() / x_mask.sum()
+    x_pow = torch.pow( (x - x_mean) , 2 )
+    print('x_pow', x_pow)
+    print('x', x * x_mask)
+    x_pow_mean = (x_pow * x_mask).sum() / x_mask.sum()
+    return x_mean, torch.sqrt(x_pow_mean)
 
-def whiten(values: Tensor, shift_mean=True, epsilon=1e-8) -> Tensor:
+def whiten(values: Tensor, shift_mean=True, epsilon=1e-8, max_len=0) -> Tensor:
+    if values.size(0) < 8:
+        print('values', values.shape, values.device)
+        if max_len > 0:
+            pad_value = 100.0
+            values_pad = pad(values, [values.shape[0], max_len], value=pad_value, left=False)
+            tensor_list = [torch.zeros_like(values_pad, device=values_pad.device) for _ in range(torch.distributed.get_world_size())]
+            #deepspeed.comm.all_gather(tensor_list, values_pad, async_op=True)
+            torch.distributed.all_gather(tensor_list, values_pad)
+            values_all = torch.cat(tensor_list, 0)
+            mean, std = mean_std_with_mask(values_all, pad_value)
+            whitened = (values - mean) / (std + epsilon)
+            print('values_all', values_all, values_all.shape)
+            print('whitened', whitened)
+        else:
+            tensor_list = [torch.zeros_like(values, device=values.device) for _ in range(torch.distributed.get_world_size())]
+            torch.distributed.all_gather(tensor_list, values)
+            values_all = torch.cat(tensor_list, 0)
+            mean, std = values_all.mean(), values_all.std(unbiased=False)  # noqa
+            whitened = (values - mean) / (std + epsilon)
+        if not shift_mean:
+            whitened = whitened + mean
+        return whitened
     assert values.size(0) >= 8, f"Internal error: Minibatch size {values.size(0)} is insufficient for whitening."
     mean, std = values.mean(), values.std(unbiased=False)  # noqa
     whitened = (values - mean) / (std + epsilon)

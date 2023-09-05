@@ -30,6 +30,7 @@ import torch
 import transformers
 from torch.utils.data import DataLoader
 
+from . import constants
 from . import logging
 from .types import Numeric
 
@@ -42,6 +43,23 @@ pathexists = os.path.exists
 makedirs = functools.partial(os.makedirs, exist_ok=True)
 dirname = os.path.dirname
 basename = os.path.basename
+
+def get_gpu_memory():
+    import subprocess as sp
+    import os
+    command = "nvidia-smi --query-gpu=memory.free --format=csv"
+    memory_free_info = sp.check_output(command.split()).decode('ascii').split('\n')[:-1][1:]
+    memory_free_values = [int(x.split()[0]) for i, x in enumerate(memory_free_info)]
+    return memory_free_values
+
+class SaveToCpu(torch.nn.Module):
+    def __init__(self, module):
+        super().__init__()
+        self.module = module
+
+    def forward(self, *args, **kwargs):
+        with torch.autograd.graph.save_on_cpu(pin_memory=True):
+            return self.module(*args, **kwargs)
 
 
 def alleq(l: Sequence, f: Optional[Callable] = lambda x, y: x == y):
@@ -129,6 +147,24 @@ def stable_resize_token_embeddings_and_tokenizer(
     """
     tokenizer.add_special_tokens(special_tokens_dict)
     stable_resize_token_embeddings(model, len(tokenizer))
+
+
+def fix_llama_tokenizer(model=None, tokenizer=None):
+    if tokenizer is None:
+        return
+    special_tokens_dict = dict(additional_special_tokens=[])
+    if tokenizer.pad_token is None:
+        tokenizer.pad_token = tokenizer.eos_token
+        tokenizer.pad_token_id = tokenizer.eos_token_id
+        #special_tokens_dict["pad_token"] = constants.DEFAULT_PAD_TOKEN
+    if tokenizer.eos_token is None:
+        special_tokens_dict["eos_token"] = constants.DEFAULT_EOS_TOKEN
+    if tokenizer.bos_token is None:
+        special_tokens_dict["bos_token"] = constants.DEFAULT_BOS_TOKEN
+    if tokenizer.unk_token is None:
+        special_tokens_dict["unk_token"] = constants.DEFAULT_UNK_TOKEN
+    print(special_tokens_dict)
+    #stable_resize_token_embeddings_and_tokenizer(model, tokenizer, special_tokens_dict)
 
 
 def stable_resize_token_embeddings(model: transformers.PreTrainedModel, target_size: int, jitter_new_embeddings=False):

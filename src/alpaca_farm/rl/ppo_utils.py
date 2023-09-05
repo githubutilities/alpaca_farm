@@ -43,6 +43,7 @@ class TrainingArguments(transformers.TrainingArguments):
     wandb_project: str = field(default=constants.WANDB_PROJECT)
     cache_dir: Optional[str] = field(default=constants.DEFAULT_CACHE_DIR)
     flash_attn: bool = field(default=False)
+    do_export: bool = field(default=False)
     optim: str = field(default="adamw_torch")
     truncate_tokens: Optional[List[str]] = field(
         default_factory=lambda: None,
@@ -85,6 +86,9 @@ class TrainingArguments(transformers.TrainingArguments):
     kl_coef: float = field(default=0.2)
     target_kl: float = field(default=6.0)
     k_beta: float = field(default=0.1)
+    scale_reward: bool = field(default=False)
+    scale_reward_mean: float = field(default=0.0)
+    scale_reward_std: float = field(default=1.0)
     adaptive_kl: bool = field(default=False)
     eval_batches: int = field(default=sys.maxsize, metadata={"help": "Maximum number of batches to evaluate on."})
     init_value_with_reward: bool = field(
@@ -101,6 +105,14 @@ class TrainingArguments(transformers.TrainingArguments):
     response_len: int = field(default=300)
     policy_model_name_or_path: str = field(default=None)
     reward_model_name_or_path: str = field(default=None)
+    save_format: str = field(default="full")
+    wrap_layer_name: str = field(default="transformers.models.llama.modeling_llama.LlamaDecoderLayer")
+    checkpoint_layer_name: str = field(default="transformers.models.llama.modeling_llama.LlamaDecoderLayer")
+    offload_layer_name: str = field(default="")
+    use_pp: bool = field(default=False)
+    use_gradient_checkpointing: bool = field(default=False)
+    #gradient_checkpointing_offload: bool = field(default=False)
+    cpu_offload: bool = field(default=False)
     use_fast_tokenizer: bool = field(
         default=False,
         metadata={

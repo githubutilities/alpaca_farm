@@ -85,6 +85,9 @@ class TrainingArguments(transformers.TrainingArguments):
             "redundant compute. If 'longest', pads to the longest sequence in the batch, capped by `model_max_length`."
         },
     )
+    padding_side: Literal["left", "right"] = field(
+        default="right",
+    )
     initialize_model_on_cpu: bool = field(
         default=False,
         metadata={
@@ -129,10 +132,11 @@ def main():
             flash_attn=training_args.flash_attn,
             fp16=training_args.fp16,
             bf16=training_args.bf16,
-            config=transformers.AutoConfig.from_pretrained(model_args.model_name_or_path),
+            config=transformers.AutoConfig.from_pretrained(model_args.model_name_or_path, trust_remote_code=True),
             cache_dir=training_args.cache_dir,
             low_cpu_mem_usage=low_cpu_mem_usage,
             device_map=device_map,
+            trust_remote_code=True,
         )
         common.let_model_save_mem_when_zero_grad(model)
 
@@ -140,15 +144,16 @@ def main():
         model_args.model_name_or_path,
         cache_dir=training_args.cache_dir,
         model_max_length=training_args.model_max_length,
-        padding_side="right",  # Ensures properly masking out the source tokens.
+        padding_side=training_args.padding_side,  # Ensures properly masking out the source tokens.
         use_fast=training_args.use_fast_tokenizer,
+        trust_remote_code=True,
     )
     tokenizer.padding = training_args.padding
 
     # Collect special tokens. Only add if non-existent.
     special_tokens_dict = dict(additional_special_tokens=[])
-    if tokenizer.pad_token is None:
-        special_tokens_dict["pad_token"] = training_args.pad_token
+    utils.fix_llama_tokenizer(model, tokenizer=tokenizer)
+        #special_tokens_dict["pad_token"] = training_args.pad_token
     if tokenizer.eos_token is None:
         special_tokens_dict["eos_token"] = constants.DEFAULT_EOS_TOKEN
     if tokenizer.bos_token is None:
@@ -162,6 +167,13 @@ def main():
         data_args=data_args,
         training_args=training_args,
     )
+    print('data_size', len(data_module['train_dataset']))
+    for idx, e in enumerate(data_module['train_dataset']):
+        print(e)
+        print(e['input_ids'].shape)
+        print(tokenizer.decode(e['input_ids']))
+        if idx > 3:
+            break
 
     # Tokenizer is only supplied so that it gets saved; this makes loading easier.
     trainer = Trainer(

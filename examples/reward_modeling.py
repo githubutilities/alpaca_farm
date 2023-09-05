@@ -38,7 +38,8 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     dataset_path: str = field(default="tatsu-lab/alpaca_farm")
-    dataset_name: Literal["alpaca_human_preference", "alpaca_gpt4_preference", "alpaca_noisy_multi_preference"] = field(
+    dataset_name: str = field(
+        #Literal["alpaca_human_preference", "alpaca_gpt4_preference", "alpaca_noisy_multi_preference"] = field(
         default="alpaca_noisy_multi_preference",
         metadata={"help": "Name of the dataset. Fetches the human or GPT-4 preference data."},
     )
@@ -59,6 +60,7 @@ class TrainingArguments(transformers.TrainingArguments):
     wandb_project: str = field(default=constants.WANDB_PROJECT)
     flash_attn: bool = field(default=False)
     optim: str = field(default="adamw_torch")
+    use_sft_loss: bool = field(default=False)
     model_max_length: int = field(
         default=512,
         metadata={
@@ -135,6 +137,7 @@ def main():
             low_cpu_mem_usage=low_cpu_mem_usage,
             device_map=device_map,
             config=config,
+            trust_remote_code=True,
         )
         common.let_model_save_mem_when_zero_grad(model)
 
@@ -144,13 +147,24 @@ def main():
         model_max_length=training_args.model_max_length,
         padding_side="left",  # Ensure reward is always extracted at the last token embedding.
         use_fast=training_args.use_fast_tokenizer,
+        trust_remote_code=True,
     )
+    utils.fix_llama_tokenizer(tokenizer=tokenizer)
     tokenizer.padding = training_args.padding
     data_module = data_utils.make_binary_reward_modeling_data_module(
         tokenizer=tokenizer,
         data_args=data_args,
         training_args=training_args,
     )
+    print('data_size', len(data_module['train_dataset']))
+    for idx, e in enumerate(data_module['train_dataset']):
+        print(e)
+        print(tokenizer.decode(e['input_ids'][0]))
+        if idx > 10:
+            break
+
+    if training_args.use_sft_loss:
+        model.use_sft_loss = True
 
     trainer = Trainer(
         model=model,

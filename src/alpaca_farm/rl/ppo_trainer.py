@@ -21,7 +21,7 @@ import torch
 import tqdm
 import transformers
 from torch import nn
-from torch.distributed.fsdp.fully_sharded_data_parallel import FullStateDictConfig
+from torch.distributed.fsdp.fully_sharded_data_parallel import FullStateDictConfig, LocalStateDictConfig, LocalOptimStateDictConfig, ShardedStateDictConfig
 from torch.distributed.fsdp.fully_sharded_data_parallel import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp.fully_sharded_data_parallel import StateDictType
 from transformers.modeling_utils import unwrap_model
@@ -145,6 +145,12 @@ class PPOTrainer(rl_trainer.RLTrainer):
             policy_outputs = common.unpack_dict(
                 policy_outputs, keys=("logprobs", "values", "entropies"), return_type=dict
             )
+            if self.args.scale_reward:
+                values = policy_outputs["values"]
+                values = (values - self.args.scale_reward_mean) / self.args.scale_reward_std
+                values = torch.clamp(values, min=-1.0, max=1.0)
+                policy_outputs["values"] = values
+     
             ref_policy_outputs = common.unpack_dict(
                 ref_policy_outputs, keys=("logprobs", "entropies"), return_type=dict
             )
@@ -221,6 +227,10 @@ class PPOTrainer(rl_trainer.RLTrainer):
         validity_mask = torch.stack(validity_masks).any(dim=0)  # Sequence is valid if it ends with any end token.
         rewards = reward_outputs["rewards"]
         rewards[~validity_mask] = self.args.penalty_reward_value
+        if self.args.scale_reward:
+            rewards = (rewards - self.args.scale_reward_mean) / self.args.scale_reward_std
+            rewards = torch.clamp(rewards, min=-1.0, max=1.0)
+        reward_outputs["rewards"] = rewards
         return reward_outputs
 
     def compute_loss(self, rollouts: Dict[str, Tensor]) -> Tuple[Tensor, Dict]:
@@ -311,6 +321,77 @@ class PPOTrainer(rl_trainer.RLTrainer):
         return stats
 
     @torch.inference_mode()
+    def load_and_save_model(self, src_dir, output_dir):
+        utils.makedirs(output_dir)
+
+        model, tokenizer = self.policy, self.tokenizer
+
+        if True:
+        #if "local" in self.args.save_format:
+            from torch.distributed._shard.checkpoint import (
+                FileSystemReader,
+                FileSystemWriter,
+                save_state_dict,
+                load_state_dict,
+            )
+            reader = FileSystemReader(src_dir)
+            with FSDP.state_dict_type(
+                model,
+                StateDictType.LOCAL_STATE_DICT, # or any other StateDictType
+                #LocalStateDictConfig(offload_to_cpu=True, use_dtensor=True), # or without this line
+            ):
+                torch.distributed.barrier()
+                state_dict = model.state_dict()
+                load_state_dict(state_dict, reader)
+                model.load_state_dict(state_dict)
+                logger.warning("local state_dict loaded.")
+
+        with FSDP.state_dict_type(
+            model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
+        ):
+            logger.warning("Gathering full state_dict...")
+            state_dict = model.state_dict()
+            logger.warning("Finished gathering full state_dict...")
+
+        if self.accelerator.is_main_process:
+            save_mem = False
+            # Retain and remap policy keys.
+            if not save_mem:
+                new_state_dict = dict()
+                prefix = "policy.base_model."
+                for key, value in state_dict.items():
+                    if key.startswith(prefix):
+                        new_state_dict[key[len(prefix) :]] = value
+                state_dict = new_state_dict
+            else:
+                prefix = "policy.base_model."
+                for key in list(state_dict.keys()):
+                    if key.startswith(prefix):
+                        state_dict[key[len(prefix) :]] = state_dict[key].cpu()
+
+            if not save_mem:
+                cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+                del state_dict
+            else:
+                cpu_state_dict = state_dict
+
+            unwrapped = unwrap_model(model).policy.base_model
+            assert isinstance(
+                unwrapped, (transformers.OPTForCausalLM, transformers.LlamaForCausalLM)
+            ), f"Expected to save a generative policy, but found model to be of type: {type(unwrapped)}."
+            if hasattr(unwrapped, "_keys_to_ignore_on_save"):
+                logger.warning(f"keys to ignore on save: {unwrapped._keys_to_ignore_on_save}")
+            logger.warning(f"Saving model checkpoint to {output_dir}")
+            logger.warning(f"Saving {len(cpu_state_dict)} keys:\n{utils.jdumps(cpu_state_dict.keys())}")
+            unwrapped.save_pretrained(output_dir, state_dict=cpu_state_dict)
+
+            tokenizer.save_pretrained(output_dir)
+
+            # Good practice: save your training arguments together with the trained model
+            torch.save(self.args, os.path.join(output_dir, constants.TRAINING_ARGS_NAME))
+        torch.distributed.barrier()
+
+    @torch.inference_mode()
     def save_model(self, output_dir: Optional[str] = None, give_rw_access=True, check_corrupted=True):
         # We don't use accelerator here because, we want to be frugal and only store the policy.
         # Moreover, we want easy loadability -- calling .from_pretrained on the folder. Full dump wouldn't allow this.
@@ -324,6 +405,71 @@ class PPOTrainer(rl_trainer.RLTrainer):
         utils.makedirs(output_dir)
 
         model, tokenizer = self.policy, self.tokenizer
+
+        if "local" in self.args.save_format:
+            from torch.distributed._shard.checkpoint import (
+                FileSystemReader,
+                FileSystemWriter,
+                save_state_dict,
+                load_state_dict,
+            )
+            local_dir = os.path.join(output_dir, 'local')
+            writer = FileSystemWriter(local_dir)
+            with FSDP.state_dict_type(
+                model,
+                StateDictType.LOCAL_STATE_DICT, # or any other StateDictType
+                LocalStateDictConfig(offload_to_cpu=True, use_dtensor=True), # or without this line
+            ):
+                logger.warning("Gathering local state_dict...")
+                state_dict = model.state_dict()
+                cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+                del state_dict
+                logger.warning("Finished gathering local state_dict...")
+
+                if self.accelerator.is_main_process:
+                    tokenizer.save_pretrained(output_dir)
+
+                save_state_dict(cpu_state_dict, writer)
+
+                fn = os.path.join(output_dir, 'local_shard_{}.bin'.format(torch.distributed.get_rank()))
+                torch.save(cpu_state_dict, fn)
+
+                # Good practice: save your training arguments together with the trained model
+                torch.save(self.args, os.path.join(output_dir, constants.TRAINING_ARGS_NAME))
+                del cpu_state_dict
+
+        #if "shard" in self.args.save_format:
+        if False:
+            if self.accelerator.is_main_process:
+                tokenizer.save_pretrained(output_dir)
+            self.accelerator.save_model(model, os.path.join(output_dir, "acc"))
+
+        if "shard" in self.args.save_format:
+            with FSDP.state_dict_type(
+                model,
+                StateDictType.SHARDED_STATE_DICT, # or any other StateDictType
+                ShardedStateDictConfig(offload_to_cpu=False, use_dtensor=True), # or without this line
+            ):
+                logger.warning("Gathering shard state_dict...")
+                state_dict = model.state_dict()
+                #cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+                #del state_dict
+                cpu_state_dict = state_dict
+                logger.warning("Finished gathering shard state_dict...")
+
+                if self.accelerator.is_main_process:
+                    tokenizer.save_pretrained(output_dir)
+
+                fn = os.path.join(output_dir, 'shard_{}.bin'.format(torch.distributed.get_rank()))
+                torch.save(cpu_state_dict, fn)
+
+                # Good practice: save your training arguments together with the trained model
+                torch.save(self.args, os.path.join(output_dir, constants.TRAINING_ARGS_NAME))
+                del cpu_state_dict
+
+        if "full" not in self.args.save_format:
+            return
+
         with FSDP.state_dict_type(
             model, StateDictType.FULL_STATE_DICT, FullStateDictConfig(offload_to_cpu=True, rank0_only=True)
         ):
@@ -332,20 +478,31 @@ class PPOTrainer(rl_trainer.RLTrainer):
             logger.warning("Finished gathering full state_dict...")
 
         if self.accelerator.is_main_process:
+            save_mem = False
             # Retain and remap policy keys.
-            new_state_dict = dict()
-            prefix = "policy.base_model."
-            for key, value in state_dict.items():
-                if key.startswith(prefix):
-                    new_state_dict[key[len(prefix) :]] = value
-            state_dict = new_state_dict
+            if not save_mem:
+                new_state_dict = dict()
+                prefix = "policy.base_model."
+                for key, value in state_dict.items():
+                    if key.startswith(prefix):
+                        new_state_dict[key[len(prefix) :]] = value
+                state_dict = new_state_dict
+            else:
+                prefix = "policy.base_model."
+                for key in list(state_dict.keys()):
+                    if key.startswith(prefix):
+                        state_dict[key[len(prefix) :]] = state_dict[key].cpu()
+
 
             if check_corrupted:  # Let the checks run on GPU.
                 is_corrupted = any(value.isnan().any().item() for value in state_dict.values())
                 logger.warning(f"Is there nans in the state_dict to be dumped? {is_corrupted}")
 
-            cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
-            del state_dict
+            if not save_mem:
+                cpu_state_dict = {key: value.cpu() for key, value in state_dict.items()}
+                del state_dict
+            else:
+                cpu_state_dict = state_dict
 
             unwrapped = unwrap_model(model).policy.base_model
             assert isinstance(
@@ -404,25 +561,51 @@ def make_models(
     args,
     accelerator: accelerate.Accelerator,
 ) -> dict:
-    def make_generative_policy():
+    def my_import(name):
+        components = name.split('.')
+        mod = __import__(components[0])
+        for comp in components[1:]:
+            mod = getattr(mod, comp)
+        return mod
+
+    def get_module_list(layer_name_list):
+        transformer_cls_to_wrap = set()
+        layer_class_names = layer_name_list.split(",")
+        for layer_class in layer_class_names:
+            if layer_class.strip() == '':
+                continue
+            transformer_cls = my_import(layer_class)
+            if transformer_cls is None:
+                raise Exception("Could not find the transformer layer class to wrap in the model.")
+            else:
+                transformer_cls_to_wrap.add(transformer_cls)
+        return transformer_cls_to_wrap
+
+
+    def make_generative_policy(use_pp=False):
         base_model = common.make_generative_lm(
             model_name_or_path=args.policy_model_name_or_path,
             flash_attn=args.flash_attn,
-            mixed_precision=accelerator.mixed_precision,
+            fp16=True,
+            #mixed_precision=accelerator.mixed_precision,
             cache_dir=args.cache_dir,
             low_cpu_mem_usage=True,
+            use_pp=use_pp,
             device_map={"": accelerator.device},
         )
         utils.stable_resize_token_embeddings(base_model, len(tokenizer))
         return base_model
 
-    def make_reward_model():
+    def make_reward_model(use_pp=False):
+        print(args.reward_model_name_or_path, accelerator.device)
         return reward_model_module.RewardModel.from_pretrained(
             args.reward_model_name_or_path,
             flash_attn=args.flash_attn,
-            mixed_precision=accelerator.mixed_precision,
+            fp16=True,
+            #mixed_precision=accelerator.mixed_precision,
             cache_dir=args.cache_dir,
             low_cpu_mem_usage=True,
+            use_pp=use_pp,
             device_map={"": accelerator.device},
         )
 
@@ -431,21 +614,87 @@ def make_models(
     # Especially so for multiple processes on single node, each starting off with a copy of the model.
     # General strategy is to 1) create a model, 2) move it to target device / shard it, 3) then start next model,
     # as opposed to creating all needed models on CPU first, and separately moving / sharding each.
-    policy = rl_models.make_policy_with_base_model(args, make_generative_policy(), tokenizer)
-    if args.init_value_with_reward:
+    policy = rl_models.make_policy_with_base_model(args, make_generative_policy(use_pp=args.use_pp), tokenizer)
+
+    if args.use_pp:
+        import torch.distributed.rpc
+        from torch.distributed.pipeline.sync import Pipe
+        rank = torch.distributed.get_rank()
+        world_size = torch.distributed.get_world_size()
+        num_layer = len(policy.base_model.model.layers)
+        chunks = (num_layer + world_size - 1) // world_size
+        import os
+        print('pp_chunks', chunks, os.environ['MASTER_ADDR'], os.environ['MASTER_PORT'])
+        torch.distributed.rpc.init_rpc('worker_{}'.format(rank), rank=rank, world_size=world_size)
+        checkpoint = 'except_last'
+        policy.base_model.model.layers = Pipe(policy.base_model.model.layers, checkpoint=checkpoint, chunks=chunks)
+
+    policy = accelerator.prepare(policy)  # noqa
+    if args.do_export:
+        value_model = policy
+    elif args.init_value_with_reward:
         # Initialize value from reward model a la OAI.
         logger.warning("Initializing value model with reward model.")
-        value_model = rl_models.make_value_with_base_model(args, make_reward_model().backbone_model, tokenizer)
+        value_model = rl_models.make_value_with_base_model(args, make_reward_model(use_pp=args.use_pp).backbone_model, tokenizer)
     else:
         logger.warning("Initializing value model with policy model.")
         # Initialize value from policy. Works for sanity, but generally performs worse in instruction-following.
         value_model = rl_models.make_value_with_base_model(args, make_generative_policy(), tokenizer)
+    if args.use_pp:
+        value_model.base_model.model.layers = Pipe(value_model.base_model.model.layers, checkpoint=checkpoint, chunks=chunks)
+
+    value_model = accelerator.prepare(value_model)  # noqa
+
+    from alpaca_farm.utils import get_gpu_memory
+    print('gpu_memory_free', get_gpu_memory())
+    check_fn, wrapper = None, None
+    if args.use_gradient_checkpointing:
+        logger.warning("Enabling gradient checkpointing...")
+        import functools
+        checkpoint_cls_set = get_module_list(args.checkpoint_layer_name)
+        offload_cls_set = get_module_list(args.offload_layer_name)
+        print('use_gradient_checkpointing', checkpoint_cls_set)
+        print('use_gradient_offload', offload_cls_set)
+        from torch.distributed.algorithms._checkpoint.checkpoint_wrapper import checkpoint_wrapper, offload_wrapper, apply_activation_checkpointing, CheckpointImpl
+        check_fn = lambda x: isinstance(x, tuple(checkpoint_cls_set))
+        def checkpoint_check_fn(x):
+            ret = isinstance(x, tuple(checkpoint_cls_set))
+            print('checkpoint_check_fn', ret, x)
+            return ret
+
+        check_fn = checkpoint_check_fn
+        #check_fn = lambda _: True
+        if True:
+            wrapper = checkpoint_wrapper
+            wrapper = functools.partial(
+                checkpoint_wrapper,
+                checkpoint_impl=CheckpointImpl.NO_REENTRANT,
+            )
+
+        apply_activation_checkpointing(policy, checkpoint_wrapper_fn=wrapper, check_fn=check_fn)
+        apply_activation_checkpointing(value_model, checkpoint_wrapper_fn=wrapper, check_fn=check_fn)
+
+        if len(offload_cls_set) > 0:
+            def offload_check_fn(x):
+                ret = isinstance(x, tuple(checkpoint_cls_set))
+                print('offload_check_fn', ret, x)
+                return ret
+            wrapper = offload_wrapper
+            #check_fn = lambda x: isinstance(x, tuple(offload_cls_set))
+            check_fn = offload_check_fn
+            apply_activation_checkpointing(policy, checkpoint_wrapper_fn=wrapper, check_fn=check_fn)
+            apply_activation_checkpointing(value_model, checkpoint_wrapper_fn=wrapper, check_fn=check_fn)
+    print('policy', policy)
+
+
     actor_critic = rl_models.ActorCritic(policy=policy, value_model=value_model)
+    if args.do_export:
+        return dict(policy=actor_critic, ref_policy=None, reward_model=None)
     # We cast how respond should run. It's important the dtypes be consistent with training, since a bf16
     # fine-tuned model might not work with fp16 inference.
     # Cast step below must precede accelerator.prepare(), since wrapped model might not have `respond` method.
     actor_critic = common.prepare_model_for_custom_fn(model=actor_critic, fn_name="respond", accelerator=accelerator)
-    actor_critic = accelerator.prepare(actor_critic)  # noqa
+    #actor_critic = accelerator.prepare(actor_critic)  # noqa
 
     ref_policy = rl_models.make_policy_with_base_model(args, make_generative_policy(), tokenizer)
     ref_policy.requires_grad_(False)

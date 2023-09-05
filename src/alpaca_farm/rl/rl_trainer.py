@@ -138,21 +138,44 @@ class RLTrainer(object):
                 enumerate(rollouts_dataloader, 1), disable=not self.accelerator.is_main_process, desc="gradstep"
             ):
                 with self.accelerator.accumulate(self.policy):
+                    if self.accelerator.is_main_process:
+                        from alpaca_farm.utils import get_gpu_memory
+                        print('before backward', batch_idx, get_gpu_memory())
+
                     ppo_loss, stats_for_this_step = self.compute_loss(rollouts_batch)
                     self.accelerator.backward(ppo_loss)
+                    if self.accelerator.is_main_process:
+                        from alpaca_farm.utils import get_gpu_memory
+                        print('after backward', batch_idx, get_gpu_memory())
+
                     if self.accelerator.sync_gradients:
                         # Gradient norm almost blows up at some point, but stabilizes eventually, even w/o clipping.
                         if self.args.max_grad_norm is not None:
                             self.accelerator.clip_grad_norm_(self.policy.parameters(), self.args.max_grad_norm)
-                        stats_for_this_step["loss/grad_norm"] = self._compute_grad_norm()
+                        #stats_for_this_step["loss/grad_norm"] = self._compute_grad_norm()
                         stats_list.append(stats_for_this_step)
+                    if self.accelerator.is_main_process:
+                        stats = stats_for_this_step
+                        print(stats)
+                        for k in stats.keys():
+                            try:
+                                line = "{}_step: {}".format(k, str(stats[k].item()))
+                                print(line)
+                            except:
+                                pass
                     self.optimizer.step()
                     self.optimizer.zero_grad(set_to_none=True)
         return common.merge_dict(stats_list, torch.stack)  # list of dict -> dict: str -> 1-D tensor
 
     def step(self, train_dataloader, step_idx: int):
         queries_batches = [next(train_dataloader) for _ in range(self.args.rollout_accumulation_steps)]
+        if self.accelerator.is_main_process:
+            from alpaca_farm.utils import get_gpu_memory
+            print('gpu_memory_free', get_gpu_memory())
         rollouts = self.rollout(queries_batches)
+        if self.accelerator.is_main_process:
+            from alpaca_farm.utils import get_gpu_memory
+            print('gpu_memory_free', get_gpu_memory())
         train_stats = self.step_with_rollouts(rollouts)
         if self.lr_scheduler is not None:
             self.lr_scheduler.step()
@@ -160,6 +183,14 @@ class RLTrainer(object):
             rollouts=rollouts, train_stats=train_stats, step_idx=step_idx, kl_coef=self.kl_ctl.value
         )
         self.kl_ctl.step(stats["objective/kl_sum_seq"])
+        if self.accelerator.is_main_process:
+            print(stats)
+            for k in stats.keys():
+                try:
+                    line = "{}: {}".format(k, str(stats[k]))
+                    print(line)
+                except:
+                    pass
         return stats
 
     def create_optimizer_and_scheduler(self, num_training_steps: int):
@@ -193,7 +224,14 @@ class RLTrainer(object):
                 self.save_model(utils.join(self.args.output_dir, f"checkpoint-{step_idx}"))
             if self.args.eval_steps is not None and step_idx % self.args.eval_steps == 0:
                 self.evaluate(step_idx)
-            self.log_history.append(self.step(infinite_train_dataloader, step_idx))
+            stat = self.step(infinite_train_dataloader, step_idx)
+            if self.accelerator.is_main_process:
+                for k in stat.keys():
+                    line = "{}: {}".format(k, str(stat[k]))
+                    print(stat)
+                    print(line)
+
+            self.log_history.append(stat)
         return self.log_history
 
     @torch.inference_mode()

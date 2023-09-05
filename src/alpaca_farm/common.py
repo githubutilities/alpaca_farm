@@ -29,7 +29,8 @@ from torch import nn
 from torch.distributed.fsdp import FullStateDictConfig
 from torch.distributed.fsdp import FullyShardedDataParallel as FSDP
 from torch.distributed.fsdp import StateDictType
-from transformers.trainer import WEIGHTS_NAME, is_deepspeed_zero3_enabled
+from transformers.trainer import WEIGHTS_NAME
+from transformers.deepspeed import is_deepspeed_zero3_enabled
 
 from . import constants, logging, utils
 from .types import AnyPath, AnyPathOrNone
@@ -115,7 +116,17 @@ def make_generative_lm(
 
         model_cls = flash_llama.LlamaForCausalLM
     else:
-        model_cls = transformers.LlamaForCausalLM
+        #model_cls = transformers.LlamaForCausalLM
+        model_cls = transformers.AutoModelForCausalLM
+        if 'config' in kwargs and kwargs['config'].__class__.__name__ == 'ChatGLMConfig':
+            model_cls = transformers.AutoModel
+    use_pp = kwargs.pop('use_pp', False)
+    if use_pp:
+        print('use_pp', model_name_or_path)
+        from transformers import AutoConfig
+        config = AutoConfig.from_pretrained(model_name_or_path)
+        config.use_pp = use_pp
+        kwargs['config'] = config
 
     return model_cls.from_pretrained(model_name_or_path, **kwargs)
 
@@ -284,7 +295,7 @@ def get_transformer_hidden_size(model: transformers.PreTrainedModel):
         llama_cls = getattr(
             transformers, "LLaMAForCausalLM" if hasattr(transformers, "LLaMAForCausalLM") else "LlamaForCausalLM"
         )
-        if isinstance(model, llama_cls):
+        if isinstance(model, llama_cls) or model.__class__.__name__ in ['BaiChuanForCausalLM']:
             hidden_size_attr_name = "hidden_size"
         else:
             raise ValueError(f"Unknown base_model type: {type(model)}")

@@ -12,6 +12,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import datasets
 import pandas as pd
 import transformers
@@ -31,6 +32,17 @@ from .data_preprocessor import (
 logger = logging.get_logger(__name__)
 
 
+def load_my_dataset(dataset_path, dataset_name, split_list):
+    if os.path.exists( dataset_name ):
+        data_files = {}
+        for split in split_list:
+            fn = os.path.join(dataset_name, split)
+            data_files[split] = fn.rstrip(os.sep) + '.json'
+        ret = datasets.load_dataset("json", data_files=data_files)
+    else:
+        ret = datasets.load_dataset(dataset_path, dataset_name)
+    return ret
+
 def make_supervised_data_module(
     tokenizer: transformers.PreTrainedTokenizer,
     data_args,
@@ -38,7 +50,7 @@ def make_supervised_data_module(
 ):
     prompt_dict = utils.jload(data_args.prompt_dict_path)
 
-    alpaca_instructions = datasets.load_dataset(data_args.dataset_path, data_args.dataset_name)
+    alpaca_instructions = load_my_dataset(data_args.dataset_path, data_args.dataset_name, split_list=["sft", "val"])
 
     train_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.train_splits])
     train_dataset = SFTDataset(
@@ -75,7 +87,7 @@ def make_binary_reward_modeling_data_module(
 ):
     prompt_dict = utils.jload(data_args.prompt_dict_path)
 
-    alpaca_human_preference = datasets.load_dataset(data_args.dataset_path, data_args.dataset_name)
+    alpaca_human_preference = load_my_dataset(data_args.dataset_path, data_args.dataset_name, split_list=["preference"])
     train_df = pd.DataFrame(alpaca_human_preference["preference"])
 
     train_dataset = BinaryRewardModelingDataset(
@@ -100,7 +112,7 @@ def make_rl_data_module(
 ):
     prompt_dict = utils.jload(data_args.prompt_dict_path)
 
-    alpaca_instructions = datasets.load_dataset(data_args.dataset_path, data_args.dataset_name)
+    alpaca_instructions = load_my_dataset(data_args.dataset_path, data_args.dataset_name, split_list=["unlabeled", "val"])
     train_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.train_splits])
     eval_df = pd.concat([pd.DataFrame(alpaca_instructions[split]) for split in data_args.eval_splits])
 

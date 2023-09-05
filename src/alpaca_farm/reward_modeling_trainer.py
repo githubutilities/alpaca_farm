@@ -42,9 +42,29 @@ class Trainer(transformers.Trainer):
         rewards_0, rewards_1 = tuple(
             torch_ops.batch_select(rewards, index) for index in (index_0, index_1)
         )  # Size: (bsz, num_pairs).
+
         logits = rewards_1 - rewards_0  # Size: (bsz, num_pairs).
         # Type casting of `choice` is due to amp.autocast context manager.
         loss = F.binary_cross_entropy_with_logits(logits, choice.to(logits.dtype), reduction="mean")
+
+        if getattr(model, 'use_sft_loss', False) and self.model.training:
+            labels = input_ids
+            logits = outputs.logits
+            logits = einops.rearrange(logits, "(b c) d e -> b c d e", c=num_candidates)
+            logits = torch_ops.batch_select(logits, index_0).squeeze(1)
+            labels = torch_ops.batch_select(labels, index_0).squeeze(1)
+            # Shift so that tokens < n predict n
+            shift_logits = logits[..., :-1, :].contiguous()
+            shift_labels = labels[..., 1:].contiguous()
+            # Flatten the tokens
+            loss_fct = torch.nn.CrossEntropyLoss()
+            shift_logits = shift_logits.view(-1, model.backbone_model.config.vocab_size)
+            shift_labels = shift_labels.view(-1)
+            # Enable model parallelism
+            shift_labels = shift_labels.to(shift_logits.device)
+            sft_loss = loss_fct(shift_logits, shift_labels)
+            loss += sft_loss
+
         return (loss, dict(logits=logits)) if return_outputs else loss
 
 
@@ -56,8 +76,8 @@ def compute_reward_modeling_metrics(eval_prediction: EvalPrediction) -> Dict:
     accuracy = predictions.eq(labels).float().mean().item()
     label_positive_rate = (labels == 1).float().mean().item()
     positive_rate = (predictions == 1).float().mean().item()
-    true_positive_rate = (predictions * labels).float().sum().item() / labels.sum().item()
-    false_positive_rate = (predictions * (1 - labels)).float().sum().item() / (1 - labels).sum().item()
+    true_positive_rate = (predictions * labels).float().sum().item() / ( labels.sum().item() + 1 )
+    false_positive_rate = (predictions * (1 - labels)).float().sum().item() / ( (1 - labels).sum().item() + 1)
     return dict(
         accuracy=accuracy,
         label_positive_rate=label_positive_rate,
