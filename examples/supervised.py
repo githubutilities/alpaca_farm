@@ -19,7 +19,8 @@ from dataclasses import dataclass, field
 from typing import List, Literal, Optional
 
 import transformers
-from transformers import Trainer
+#from transformers import Trainer
+from alpaca_farm.fsdp_trainer_patch import FsdpTrainer as Trainer
 
 from alpaca_farm import common, constants, data_utils, logging, utils
 

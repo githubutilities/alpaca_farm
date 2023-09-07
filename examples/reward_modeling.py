@@ -20,7 +20,7 @@ from typing import List, Literal
 
 import transformers
 
-from alpaca_farm import common, constants, data_utils, logging
+from alpaca_farm import common, constants, data_utils, logging, utils
 from alpaca_farm.models import reward_model
 from alpaca_farm.reward_modeling_trainer import Trainer, compute_reward_modeling_metrics
 

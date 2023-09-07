@@ -1,0 +1,4 @@
+{
+    "prompt_noinputs": "{instruction}\n{input}",
+    "prompt_inputs": "{instruction}"
+}
