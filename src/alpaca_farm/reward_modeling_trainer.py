@@ -20,10 +20,11 @@ import torch.nn.functional as F
 import transformers
 from transformers.trainer_utils import EvalPrediction
 
+from alpaca_farm.fsdp_trainer_patch import FsdpTrainer as Trainer
 from alpaca_farm import common, torch_ops
 
 
-class Trainer(transformers.Trainer):
+class Trainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         # input_ids, attention_mask each of size (bsz, num_candidates, seq_len).
         # index_0, index_1 each of size (bsz, num_pairs); indexes into input_ids.

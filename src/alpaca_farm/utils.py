@@ -118,7 +118,7 @@ def jdump(obj: Union[str, dict, list], f, mode="w", indent=4, default=str):
     """
     f = _make_w_io_base(f, mode)
     if isinstance(obj, (dict, list)):
-        json.dump(obj, f, indent=indent, default=default)
+        json.dump(obj, f, indent=indent, default=default, ensure_ascii=False)
     elif isinstance(obj, str):
         f.write(obj)
     else:
@@ -127,7 +127,7 @@ def jdump(obj: Union[str, dict, list], f, mode="w", indent=4, default=str):
 
 
 def jdumps(obj, indent=4, default=str):
-    return json.dumps(obj, indent=indent, default=default)
+    return json.dumps(obj, indent=indent, default=default, ensure_ascii=False)
 
 
 def mean(*seqs: Sequence[Numeric]) -> Union[Numeric, Sequence[Numeric]]:
@@ -154,6 +154,7 @@ def fix_llama_tokenizer(model=None, tokenizer=None):
         return
     special_tokens_dict = dict(additional_special_tokens=[])
     if tokenizer.pad_token is None:
+        logger.info("pad_token missing, replace it with eos_token")
         tokenizer.pad_token = tokenizer.eos_token
         tokenizer.pad_token_id = tokenizer.eos_token_id
         #special_tokens_dict["pad_token"] = constants.DEFAULT_PAD_TOKEN
